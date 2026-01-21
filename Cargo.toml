@@ -1,0 +1,15 @@
+[package]
+name = "apropos-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+bzip2 = "0.6"
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+rayon = "1"
+regex = "1"
+walkdir = "2"
+xz2 = "0.1"
+zstd = "0.13"
