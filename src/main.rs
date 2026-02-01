@@ -168,7 +168,9 @@ fn resolve_manpaths(override_path: Option<&str>) -> Vec<PathBuf> {
     }
 
     match env::var("MANPATH") {
-        Ok(value) => expand_manpath_value(&value, || system_manpaths().unwrap_or_else(default_manpaths)),
+        Ok(value) => expand_manpath_value(&value, || {
+            system_manpaths().unwrap_or_else(default_manpaths)
+        }),
         Err(_) => system_manpaths().unwrap_or_else(default_manpaths),
     }
 }
@@ -221,11 +223,7 @@ fn run_manpath_command(cmd: &str, args: &[&str]) -> Option<Vec<PathBuf>> {
 
     let raw = String::from_utf8_lossy(&output.stdout);
     let paths = normalize_paths(raw.trim().split(':').map(PathBuf::from).collect());
-    if paths.is_empty() {
-        None
-    } else {
-        Some(paths)
-    }
+    if paths.is_empty() { None } else { Some(paths) }
 }
 
 fn default_manpaths() -> Vec<PathBuf> {
