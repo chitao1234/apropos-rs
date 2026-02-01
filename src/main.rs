@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser};
 use memchr::memmem;
 use rayon::prelude::*;
@@ -100,13 +100,6 @@ fn main() {
 fn run() -> Result<()> {
     let opts = Opts::parse();
 
-    if let Some(jobs) = opts.jobs {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs)
-            .build_global()
-            .context("failed to configure thread pool")?;
-    }
-
     let matcher = build_matcher(&opts)?;
     let sections = parse_sections(&opts.sections);
     let manpaths = resolve_manpaths(opts.manpath.as_deref());
@@ -115,19 +108,33 @@ fn run() -> Result<()> {
     let files = collect_man_files(&man_dirs, &mut traversal_warnings);
     traversal_warnings.finish();
 
-    let mut matches: Vec<PathBuf> = files
-        .par_iter()
-        .filter_map(|path| match search_file(path, &matcher) {
-            Ok(true) => Some(path.clone()),
-            Ok(false) => None,
-            Err(err) => {
-                eprintln!("warning: {}: {err}", path.display());
-                None
-            }
-        })
-        .collect();
+    let search = || {
+        let mut matches: Vec<PathBuf> = files
+            .par_iter()
+            .filter_map(|path| match search_file(path, &matcher) {
+                Ok(true) => Some(path.clone()),
+                Ok(false) => None,
+                Err(err) => {
+                    eprintln!("warning: {}: {err}", path.display());
+                    None
+                }
+            })
+            .collect();
+        matches.sort();
+        matches
+    };
 
-    matches.sort();
+    let matches = match opts.jobs {
+        Some(0) => bail!("--jobs must be greater than 0"),
+        Some(jobs) => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(jobs)
+                .build()
+                .context("failed to configure thread pool")?;
+            pool.install(search)
+        }
+        None => search(),
+    };
 
     for path in matches {
         println!("{}", format_match(&path, opts.where_path));
@@ -665,4 +672,135 @@ fn strip_compression_extension(filename: &str) -> String {
         }
     }
     filename.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            path.push(format!(
+                "apropos-rs-test-{prefix}-{}-{n}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn parse_sections_splits_on_commas_colons_and_whitespace() {
+        let raw = vec!["1, 8: 3\t2".to_string(), "3".to_string()];
+        let sections = parse_sections(&raw);
+        for expected in ["1", "2", "3", "8"] {
+            assert!(sections.contains(expected));
+        }
+    }
+
+    #[test]
+    fn strip_compression_extension_strips_known_extensions() {
+        assert_eq!(strip_compression_extension("foo.1.gz"), "foo.1");
+        assert_eq!(strip_compression_extension("foo.1.bz2"), "foo.1");
+        assert_eq!(strip_compression_extension("foo.1.xz"), "foo.1");
+        assert_eq!(strip_compression_extension("foo.1.zst"), "foo.1");
+        assert_eq!(strip_compression_extension("foo.1"), "foo.1");
+    }
+
+    #[test]
+    fn search_reader_bytes_sensitive_finds_across_chunk_boundary() {
+        let mut content = vec![b'a'; SEARCH_BUF_SIZE - 1];
+        content.push(b'x');
+        content.push(b'y');
+
+        let mut cursor = Cursor::new(content);
+        assert!(search_reader_bytes_sensitive(&mut cursor, b"xy").unwrap());
+    }
+
+    #[test]
+    fn search_reader_bytes_ascii_case_insensitive_finds_across_chunk_boundary() {
+        let mut content = vec![b'a'; SEARCH_BUF_SIZE - 1];
+        content.push(b'X');
+        content.push(b'y');
+
+        let mut cursor = Cursor::new(content);
+        assert!(search_reader_bytes_ascii_case_insensitive(&mut cursor, b"xy").unwrap());
+    }
+
+    #[test]
+    fn search_reader_bytes_ascii_case_insensitive_returns_false_when_no_match() {
+        let mut cursor = Cursor::new(b"abcdef".to_vec());
+        assert!(
+            !search_reader_bytes_ascii_case_insensitive(&mut cursor, b"xyz").unwrap(),
+            "expected no match"
+        );
+    }
+
+    #[test]
+    fn collect_man_dirs_accepts_section_dir_in_manpath() {
+        let tmp = TempDir::new("mandirs-section");
+        let man1 = tmp.path.join("man1");
+        fs::create_dir_all(&man1).unwrap();
+
+        let mut warnings = WarningTracker::default();
+        let dirs = collect_man_dirs(&[man1.clone()], &HashSet::new(), &mut warnings);
+        assert!(dirs.contains(&man1));
+    }
+
+    #[test]
+    fn collect_man_dirs_filters_by_section() {
+        let tmp = TempDir::new("mandirs-filter");
+        let root = tmp.path.join("root");
+        let man1 = root.join("man1");
+        let man8 = root.join("man8");
+        fs::create_dir_all(&man1).unwrap();
+        fs::create_dir_all(&man8).unwrap();
+
+        let mut sections = HashSet::new();
+        sections.insert("8".to_string());
+
+        let mut warnings = WarningTracker::default();
+        let dirs = collect_man_dirs(&[root], &sections, &mut warnings);
+        assert!(dirs.contains(&man8));
+        assert!(!dirs.contains(&man1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_man_files_includes_symlinked_manpages() {
+        let tmp = TempDir::new("manfiles-symlink");
+        let man1 = tmp.path.join("man1");
+        fs::create_dir_all(&man1).unwrap();
+
+        let real = man1.join("foo.1");
+        fs::write(&real, b"hello").unwrap();
+
+        let link = man1.join("bar.1");
+        // Use a relative target to keep the symlink valid if the test directory moves.
+        symlink("foo.1", &link).unwrap();
+
+        let mut warnings = WarningTracker::default();
+        let files = collect_man_files(&[man1], &mut warnings);
+        assert!(files.contains(&real));
+        assert!(files.contains(&link));
+    }
 }

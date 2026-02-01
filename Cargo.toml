@@ -2,6 +2,12 @@
 name = "apropos-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Multithreaded full-text search over manpages (man -K style)"
+license = "MIT"
+readme = "README.md"
+keywords = ["apropos", "man", "manpages", "search", "cli"]
+categories = ["command-line-utilities", "text-processing"]
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"
