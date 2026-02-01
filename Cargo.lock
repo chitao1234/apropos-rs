@@ -81,6 +81,7 @@ dependencies = [
  "bzip2",
  "clap",
  "flate2",
+ "memchr",
  "rayon",
  "regex",
  "walkdir",

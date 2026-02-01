@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser};
+use memchr::memmem;
 use rayon::prelude::*;
 use regex::RegexBuilder;
 use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
@@ -56,32 +58,36 @@ struct Opts {
     jobs: Option<usize>,
 }
 
-enum Matcher {
-    Regex(regex::Regex),
-    Fixed {
-        needle: String,
-        needle_lower: String,
-        ignore_case: bool,
-    },
+#[derive(Default)]
+struct WarningTracker {
+    shown: usize,
+    suppressed: usize,
 }
 
-impl Matcher {
-    fn is_match(&self, haystack: &str) -> bool {
-        match self {
-            Matcher::Regex(re) => re.is_match(haystack),
-            Matcher::Fixed {
-                needle,
-                needle_lower,
-                ignore_case,
-            } => {
-                if *ignore_case {
-                    haystack.to_lowercase().contains(needle_lower)
-                } else {
-                    haystack.contains(needle)
-                }
-            }
+impl WarningTracker {
+    const LIMIT: usize = 20;
+
+    fn warn(&mut self, message: impl fmt::Display) {
+        if self.shown < Self::LIMIT {
+            eprintln!("warning: {message}");
+            self.shown += 1;
+        } else {
+            self.suppressed += 1;
         }
     }
+
+    fn finish(&mut self) {
+        if self.suppressed > 0 {
+            eprintln!("warning: suppressed {} more warnings", self.suppressed);
+        }
+    }
+}
+
+enum Matcher {
+    Regex(regex::Regex),
+    FixedBytes { needle: Vec<u8> },
+    FixedAsciiCaseInsensitive { needle_lower: Vec<u8> },
+    FixedUnicodeCaseInsensitive(regex::Regex),
 }
 
 fn main() {
@@ -104,8 +110,10 @@ fn run() -> Result<()> {
     let matcher = build_matcher(&opts)?;
     let sections = parse_sections(&opts.sections);
     let manpaths = resolve_manpaths(opts.manpath.as_deref());
-    let man_dirs = collect_man_dirs(&manpaths, &sections);
-    let files = collect_man_files(&man_dirs);
+    let mut traversal_warnings = WarningTracker::default();
+    let man_dirs = collect_man_dirs(&manpaths, &sections, &mut traversal_warnings);
+    let files = collect_man_files(&man_dirs, &mut traversal_warnings);
+    traversal_warnings.finish();
 
     let mut matches: Vec<PathBuf> = files
         .par_iter()
@@ -136,11 +144,29 @@ fn build_matcher(opts: &Opts) -> Result<Matcher> {
     };
 
     if use_fixed {
-        Ok(Matcher::Fixed {
-            needle: opts.pattern.clone(),
-            needle_lower: opts.pattern.to_lowercase(),
-            ignore_case: opts.ignore_case,
-        })
+        if opts.ignore_case {
+            if opts.pattern.is_ascii() {
+                let needle_lower = opts
+                    .pattern
+                    .as_bytes()
+                    .iter()
+                    .map(|b| b.to_ascii_lowercase())
+                    .collect();
+                Ok(Matcher::FixedAsciiCaseInsensitive { needle_lower })
+            } else {
+                let escaped = regex::escape(&opts.pattern);
+                let mut builder = RegexBuilder::new(&escaped);
+                builder.case_insensitive(true);
+                let regex = builder
+                    .build()
+                    .context("failed to compile case-insensitive fixed-string matcher")?;
+                Ok(Matcher::FixedUnicodeCaseInsensitive(regex))
+            }
+        } else {
+            Ok(Matcher::FixedBytes {
+                needle: opts.pattern.as_bytes().to_vec(),
+            })
+        }
     } else {
         let mut builder = RegexBuilder::new(&opts.pattern);
         builder.case_insensitive(opts.ignore_case);
@@ -336,7 +362,11 @@ fn preferred_locale_dirs() -> HashSet<String> {
     out
 }
 
-fn collect_man_dirs(manpaths: &[PathBuf], sections: &HashSet<String>) -> Vec<PathBuf> {
+fn collect_man_dirs(
+    manpaths: &[PathBuf],
+    sections: &HashSet<String>,
+    warnings: &mut WarningTracker,
+) -> Vec<PathBuf> {
     let preferred_locales = preferred_locale_dirs();
     let mut seen = HashSet::new();
     let mut dirs = Vec::new();
@@ -349,10 +379,26 @@ fn collect_man_dirs(manpaths: &[PathBuf], sections: &HashSet<String>) -> Vec<Pat
 
         let entries = match fs::read_dir(base) {
             Ok(entries) => entries,
-            Err(_) => continue,
+            Err(err) => {
+                warnings.warn(format!(
+                    "{}: failed to read directory: {err}",
+                    base.display()
+                ));
+                continue;
+            }
         };
 
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warnings.warn(format!(
+                        "{}: failed to read directory entry: {err}",
+                        base.display()
+                    ));
+                    continue;
+                }
+            };
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -375,10 +421,26 @@ fn collect_man_dirs(manpaths: &[PathBuf], sections: &HashSet<String>) -> Vec<Pat
             // locales relevant to the current environment to avoid scanning every translation.
             let locale_entries = match fs::read_dir(&path) {
                 Ok(entries) => entries,
-                Err(_) => continue,
+                Err(err) => {
+                    warnings.warn(format!(
+                        "{}: failed to read directory: {err}",
+                        path.display()
+                    ));
+                    continue;
+                }
             };
 
-            for locale_entry in locale_entries.flatten() {
+            for locale_entry in locale_entries {
+                let locale_entry = match locale_entry {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        warnings.warn(format!(
+                            "{}: failed to read directory entry: {err}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
                 let locale_path = locale_entry.path();
                 if !locale_path.is_dir() {
                     continue;
@@ -395,15 +457,17 @@ fn collect_man_dirs(manpaths: &[PathBuf], sections: &HashSet<String>) -> Vec<Pat
     dirs
 }
 
-fn collect_man_files(man_dirs: &[PathBuf]) -> Vec<PathBuf> {
+fn collect_man_files(man_dirs: &[PathBuf], warnings: &mut WarningTracker) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for dir in man_dirs {
-        for entry in WalkDir::new(dir)
-            .min_depth(1)
-            .max_depth(1)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in WalkDir::new(dir).min_depth(1).max_depth(1) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warnings.warn(format!("{}: {err}", dir.display()));
+                    continue;
+                }
+            };
             // `man` directories commonly contain symlinks for aliases (e.g. `7za.1.gz -> 7z.1.gz`).
             // `File::open` will follow symlinks, so include symlinks that ultimately point to files.
             if entry.file_type().is_file()
@@ -417,27 +481,154 @@ fn collect_man_files(man_dirs: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn search_file(path: &Path, matcher: &Matcher) -> Result<bool> {
-    let content = read_man_file(path)?;
-    Ok(matcher.is_match(&content))
+    match matcher {
+        Matcher::Regex(re) => {
+            let bytes = read_man_file_bytes(path)?;
+            let text = String::from_utf8_lossy(&bytes);
+            Ok(re.is_match(text.as_ref()))
+        }
+        Matcher::FixedBytes { needle } => {
+            let mut reader = open_man_reader(path)?;
+            search_reader_bytes_sensitive(reader.as_mut(), needle)
+                .with_context(|| format!("failed to read {}", path.display()))
+        }
+        Matcher::FixedAsciiCaseInsensitive { needle_lower } => {
+            let mut reader = open_man_reader(path)?;
+            search_reader_bytes_ascii_case_insensitive(reader.as_mut(), needle_lower)
+                .with_context(|| format!("failed to read {}", path.display()))
+        }
+        Matcher::FixedUnicodeCaseInsensitive(re) => {
+            let bytes = read_man_file_bytes(path)?;
+            let text = String::from_utf8_lossy(&bytes);
+            Ok(re.is_match(text.as_ref()))
+        }
+    }
 }
 
-fn read_man_file(path: &Path) -> Result<String> {
+fn open_man_reader(path: &Path) -> Result<Box<dyn Read>> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
 
-    let mut reader: Box<dyn Read> = match path.extension().and_then(OsStr::to_str) {
+    let reader: Box<dyn Read> = match path.extension().and_then(OsStr::to_str) {
         Some("gz") => Box::new(flate2::read::GzDecoder::new(file)),
         Some("bz2") => Box::new(bzip2::read::BzDecoder::new(file)),
         Some("xz") => Box::new(xz2::read::XzDecoder::new(file)),
-        Some("zst") => Box::new(zstd::stream::read::Decoder::new(file)?),
+        Some("zst") => Box::new(
+            zstd::stream::read::Decoder::new(file)
+                .with_context(|| format!("failed to create zstd decoder for {}", path.display()))?,
+        ),
         _ => Box::new(file),
     };
 
+    Ok(reader)
+}
+
+fn read_man_file_bytes(path: &Path) -> Result<Vec<u8>> {
+    let mut reader = open_man_reader(path)?;
     let mut buf = Vec::new();
     reader
         .read_to_end(&mut buf)
         .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(buf)
+}
 
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+const SEARCH_BUF_SIZE: usize = 64 * 1024;
+
+fn search_reader_bytes_sensitive(reader: &mut dyn Read, needle: &[u8]) -> io::Result<bool> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+
+    let finder = memmem::Finder::new(needle);
+    let keep = needle.len().saturating_sub(1);
+
+    let mut buf = vec![0_u8; SEARCH_BUF_SIZE];
+    let mut work = Vec::<u8>::new();
+    let mut carry = Vec::<u8>::new();
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        let chunk = &buf[..n];
+        if carry.is_empty() {
+            if finder.find(chunk).is_some() {
+                return Ok(true);
+            }
+        } else {
+            work.clear();
+            work.extend_from_slice(&carry);
+            work.extend_from_slice(chunk);
+            if finder.find(&work).is_some() {
+                return Ok(true);
+            }
+        }
+
+        if keep > 0 {
+            let src: &[u8] = if carry.is_empty() { chunk } else { &work };
+            let tail_len = keep.min(src.len());
+            carry.clear();
+            carry.extend_from_slice(&src[src.len() - tail_len..]);
+        }
+    }
+
+    Ok(false)
+}
+
+fn search_reader_bytes_ascii_case_insensitive(
+    reader: &mut dyn Read,
+    needle_lower: &[u8],
+) -> io::Result<bool> {
+    if needle_lower.is_empty() {
+        return Ok(true);
+    }
+
+    let finder = memmem::Finder::new(needle_lower);
+    let keep = needle_lower.len().saturating_sub(1);
+
+    let mut buf = vec![0_u8; SEARCH_BUF_SIZE];
+    let mut chunk_lower = Vec::<u8>::new();
+    let mut work = Vec::<u8>::new();
+    let mut carry = Vec::<u8>::new();
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        chunk_lower.resize(n, 0);
+        for (dst, src) in chunk_lower.iter_mut().zip(&buf[..n]) {
+            *dst = src.to_ascii_lowercase();
+        }
+
+        if carry.is_empty() {
+            if finder.find(&chunk_lower).is_some() {
+                return Ok(true);
+            }
+        } else {
+            work.clear();
+            work.extend_from_slice(&carry);
+            work.extend_from_slice(&chunk_lower);
+            if finder.find(&work).is_some() {
+                return Ok(true);
+            }
+        }
+
+        if keep > 0 {
+            let src: &[u8] = if carry.is_empty() {
+                &chunk_lower
+            } else {
+                &work
+            };
+            let tail_len = keep.min(src.len());
+            carry.clear();
+            carry.extend_from_slice(&src[src.len() - tail_len..]);
+        }
+    }
+
+    Ok(false)
 }
 
 fn format_match(path: &Path, where_path: bool) -> String {
