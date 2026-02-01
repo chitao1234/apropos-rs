@@ -216,6 +216,10 @@ where
         return Vec::new();
     }
 
+    // According to man(1), if MANPATH starts with a colon, the default path is prepended.
+    // If it ends with a colon, the default path is appended.
+    // If it contains a double colon, the default path is inserted at that point.
+    // value.split(':') will give empty strings for these cases.
     let parts: Vec<&str> = value.split(':').collect();
     let needs_default = parts.iter().any(|part| part.is_empty());
     if !needs_default {
@@ -280,7 +284,13 @@ fn normalize_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         if path.as_os_str().is_empty() {
             continue;
         }
-        if path.is_dir() && seen.insert(path.clone()) {
+        // If the path exists, we canonicalize it to handle symlinks and ensure uniqueness.
+        // If it doesn't exist, we still keep it if it's not a duplicate of what we've seen.
+        if let Ok(real_path) = path.canonicalize() {
+            if seen.insert(real_path) {
+                out.push(path);
+            }
+        } else if seen.insert(path.clone()) {
             out.push(path);
         }
     }
@@ -380,8 +390,12 @@ fn collect_man_dirs(
 
     for base in manpaths {
         // Allow passing a section dir directly (e.g. /usr/share/man/man1).
-        if is_selected_man_section_dir(base, sections) && seen.insert(base.clone()) {
-            dirs.push(base.clone());
+        if is_selected_man_section_dir(base, sections) {
+            if let Ok(real_base) = base.canonicalize() {
+                if seen.insert(real_base) {
+                    dirs.push(base.clone());
+                }
+            }
         }
 
         let entries = match fs::read_dir(base) {
@@ -411,8 +425,10 @@ fn collect_man_dirs(
                 continue;
             }
             if is_selected_man_section_dir(&path, sections) {
-                if seen.insert(path.clone()) {
-                    dirs.push(path);
+                if let Ok(real_path) = path.canonicalize() {
+                    if seen.insert(real_path) {
+                        dirs.push(path);
+                    }
                 }
                 continue;
             }
@@ -452,10 +468,12 @@ fn collect_man_dirs(
                 if !locale_path.is_dir() {
                     continue;
                 }
-                if is_selected_man_section_dir(&locale_path, sections)
-                    && seen.insert(locale_path.clone())
-                {
-                    dirs.push(locale_path);
+                if is_selected_man_section_dir(&locale_path, sections) {
+                    if let Ok(real_locale_path) = locale_path.canonicalize() {
+                        if seen.insert(real_locale_path) {
+                            dirs.push(locale_path);
+                        }
+                    }
                 }
             }
         }
@@ -467,7 +485,7 @@ fn collect_man_dirs(
 fn collect_man_files(man_dirs: &[PathBuf], warnings: &mut WarningTracker) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for dir in man_dirs {
-        for entry in WalkDir::new(dir).min_depth(1).max_depth(1) {
+        for entry in WalkDir::new(dir).follow_links(true).min_depth(1).max_depth(1) {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
@@ -475,11 +493,7 @@ fn collect_man_files(man_dirs: &[PathBuf], warnings: &mut WarningTracker) -> Vec
                     continue;
                 }
             };
-            // `man` directories commonly contain symlinks for aliases (e.g. `7za.1.gz -> 7z.1.gz`).
-            // `File::open` will follow symlinks, so include symlinks that ultimately point to files.
-            if entry.file_type().is_file()
-                || (entry.file_type().is_symlink() && entry.path().is_file())
-            {
+            if entry.file_type().is_file() {
                 files.push(entry.path().to_path_buf());
             }
         }
@@ -785,7 +799,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn collect_man_files_includes_symlinked_manpages() {
         let tmp = TempDir::new("manfiles-symlink");
         let man1 = tmp.path.join("man1");
@@ -802,5 +815,30 @@ mod tests {
         let files = collect_man_files(&[man1], &mut warnings);
         assert!(files.contains(&real));
         assert!(files.contains(&link));
+    }
+
+    #[test]
+    fn expand_manpath_value_handles_leading_trailing_and_double_colons() {
+        let defaults = vec![PathBuf::from("/def1"), PathBuf::from("/def2")];
+        let provider = || defaults.clone();
+
+        // Leading colon
+        let paths = expand_manpath_value(":/extra", provider);
+        assert_eq!(paths[0], PathBuf::from("/def1"));
+        assert_eq!(paths[1], PathBuf::from("/def2"));
+        assert_eq!(paths[2], PathBuf::from("/extra"));
+
+        // Trailing colon
+        let paths = expand_manpath_value("/extra:", provider);
+        assert_eq!(paths[0], PathBuf::from("/extra"));
+        assert_eq!(paths[1], PathBuf::from("/def1"));
+        assert_eq!(paths[2], PathBuf::from("/def2"));
+
+        // Double colon
+        let paths = expand_manpath_value("/extra1::/extra2", provider);
+        assert_eq!(paths[0], PathBuf::from("/extra1"));
+        assert_eq!(paths[1], PathBuf::from("/def1"));
+        assert_eq!(paths[2], PathBuf::from("/def2"));
+        assert_eq!(paths[3], PathBuf::from("/extra2"));
     }
 }
