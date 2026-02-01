@@ -254,10 +254,99 @@ fn normalize_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
+fn is_selected_man_section_dir(path: &Path, sections: &HashSet<String>) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    if !name.starts_with("man") || name.len() <= 3 {
+        return false;
+    }
+    let section = &name[3..];
+    sections.is_empty() || sections.contains(section)
+}
+
+fn preferred_locale_dirs() -> HashSet<String> {
+    fn add_candidates(value: &str, out: &mut HashSet<String>) {
+        let value = value.trim();
+        if value.is_empty() {
+            return;
+        }
+
+        let (before_mod, modifier) = match value.split_once('@') {
+            Some((before, modifier)) => (before, Some(modifier)),
+            None => (value, None),
+        };
+
+        let (base, codeset) = match before_mod.split_once('.') {
+            Some((base, codeset)) => (base, Some(codeset)),
+            None => (before_mod, None),
+        };
+
+        if !base.is_empty() {
+            out.insert(base.to_string());
+        }
+        if let Some(codeset) = codeset {
+            out.insert(format!("{base}.{codeset}"));
+        }
+        if let Some(modifier) = modifier {
+            out.insert(format!("{base}@{modifier}"));
+            if let Some(codeset) = codeset {
+                out.insert(format!("{base}.{codeset}@{modifier}"));
+            }
+        }
+
+        let lang = base.split_once('_').map(|(lang, _)| lang).unwrap_or(base);
+        if lang != base {
+            out.insert(lang.to_string());
+            if let Some(codeset) = codeset {
+                out.insert(format!("{lang}.{codeset}"));
+            }
+            if let Some(modifier) = modifier {
+                out.insert(format!("{lang}@{modifier}"));
+                if let Some(codeset) = codeset {
+                    out.insert(format!("{lang}.{codeset}@{modifier}"));
+                }
+            }
+        }
+    }
+
+    let mut out = HashSet::new();
+
+    // `LANGUAGE` is a colon-separated priority list (common on GNU systems).
+    if let Ok(language) = env::var("LANGUAGE") {
+        for part in language.split(':') {
+            add_candidates(part, &mut out);
+        }
+    }
+
+    // Locale env var precedence (roughly matches common expectations).
+    let locale = env::var("LC_ALL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            env::var("LC_MESSAGES")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| env::var("LANG").ok().filter(|value| !value.is_empty()));
+    if let Some(locale) = locale {
+        add_candidates(&locale, &mut out);
+    }
+
+    out
+}
+
 fn collect_man_dirs(manpaths: &[PathBuf], sections: &HashSet<String>) -> Vec<PathBuf> {
+    let preferred_locales = preferred_locale_dirs();
+    let mut seen = HashSet::new();
     let mut dirs = Vec::new();
 
     for base in manpaths {
+        // Allow passing a section dir directly (e.g. /usr/share/man/man1).
+        if is_selected_man_section_dir(base, sections) && seen.insert(base.clone()) {
+            dirs.push(base.clone());
+        }
+
         let entries = match fs::read_dir(base) {
             Ok(entries) => entries,
             Err(_) => continue,
@@ -268,16 +357,37 @@ fn collect_man_dirs(manpaths: &[PathBuf], sections: &HashSet<String>) -> Vec<Pat
             if !path.is_dir() {
                 continue;
             }
-            let name = match path.file_name().and_then(OsStr::to_str) {
-                Some(name) => name,
-                None => continue,
-            };
-            if !name.starts_with("man") || name.len() <= 3 {
+            if is_selected_man_section_dir(&path, sections) {
+                if seen.insert(path.clone()) {
+                    dirs.push(path);
+                }
                 continue;
             }
-            let section = &name[3..];
-            if sections.is_empty() || sections.contains(section) {
-                dirs.push(path);
+
+            let Some(locale) = path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if !preferred_locales.contains(locale) {
+                continue;
+            }
+
+            // Many distros place localized manpages under <root>/<locale>/manN. Only traverse
+            // locales relevant to the current environment to avoid scanning every translation.
+            let locale_entries = match fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+
+            for locale_entry in locale_entries.flatten() {
+                let locale_path = locale_entry.path();
+                if !locale_path.is_dir() {
+                    continue;
+                }
+                if is_selected_man_section_dir(&locale_path, sections)
+                    && seen.insert(locale_path.clone())
+                {
+                    dirs.push(locale_path);
+                }
             }
         }
     }
@@ -294,7 +404,11 @@ fn collect_man_files(man_dirs: &[PathBuf]) -> Vec<PathBuf> {
             .into_iter()
             .filter_map(Result::ok)
         {
-            if entry.file_type().is_file() {
+            // `man` directories commonly contain symlinks for aliases (e.g. `7za.1.gz -> 7z.1.gz`).
+            // `File::open` will follow symlinks, so include symlinks that ultimately point to files.
+            if entry.file_type().is_file()
+                || (entry.file_type().is_symlink() && entry.path().is_file())
+            {
                 files.push(entry.path().to_path_buf());
             }
         }
